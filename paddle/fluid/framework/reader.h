@@ -21,28 +21,88 @@
 #include "paddle/fluid/framework/lod_tensor_array.h"
 #include "paddle/fluid/platform/place.h"
 
+#include <memory>
+#include <unordered_set>
+#include <vector>
+
 namespace paddle {
 namespace framework {
 
-class ReaderBase {
+class ReaderBase : public std::enable_shared_from_this<ReaderBase> {
  public:
   virtual void ReadNext(std::vector<LoDTensor>* out) = 0;
 
   virtual void ReInit() = 0;
 
-  virtual ~ReaderBase();
+  void Decorate(const std::shared_ptr<ReaderBase>& reader) {
+    decorated_readers_.emplace_back(reader);
+  }
+
+  virtual std::function<void()> CloseAndOpen() {
+    // Close()
+    return [] {};
+  }
+
+  void ResetAll() {
+    std::vector<std::function<void()>> open_methods;
+    std::unordered_set<ReaderBase*> visited;
+
+    for (auto& dreader : decorated_readers_) {
+      TraceAllDecoratedReader(dreader, open_methods, visited);
+    }
+    open_methods.emplace_back(CloseAndOpen());
+
+    for (auto it = open_methods.rbegin(); it != open_methods.rend(); ++it) {
+      (*it)();
+    }
+  }
+
+  static void TraceAllDecoratedReader(
+      std::weak_ptr<ReaderBase> reader,
+      std::vector<std::function<void()>>& open_methods,
+      std::unordered_set<ReaderBase*> visited) {
+    if (auto real_reader = reader.lock()) {
+      auto* ptr = real_reader.get();
+      if (visited.count(ptr)) {
+        return;
+      }
+
+      for (auto& dreader : ptr->decorated_readers_) {
+        TraceAllDecoratedReader(dreader, open_methods, visited);
+      }
+      open_methods.emplace_back(ptr->CloseAndOpen());
+    }
+  }
+
+ protected:
+  std::vector<std::weak_ptr<ReaderBase>> decorated_readers_;
 };
 
 class DecoratedReader : public ReaderBase {
  public:
   explicit DecoratedReader(const std::shared_ptr<ReaderBase>& reader)
       : ReaderBase(), reader_(reader) {
+    reader_->Decorate(shared_from_this());
     PADDLE_ENFORCE_NOT_NULL(reader_);
   }
 
   void ReInit() override { reader_->ReInit(); }
 
+  std::function<void()> CloseAndOpen() final {
+    auto open_method = this->CloseAndOpenMyself();
+    auto underlying_open_method = reader_->CloseAndOpen();
+
+    return [=] {
+      underlying_open_method();
+      open_method();
+    };
+  }
+
  protected:
+  virtual std::function<void()> CloseAndOpenMyself() {
+    return [] {};
+  }
+
   std::shared_ptr<ReaderBase> reader_;
 };
 

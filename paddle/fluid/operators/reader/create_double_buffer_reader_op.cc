@@ -186,7 +186,6 @@ void DoubleBufferReader::PrefetchThreadFunc() {
   channel_->Close();
   VLOG(5) << "Prefetch thread terminates.";
 }
-
 }  // namespace reader
 }  // namespace operators
 }  // namespace paddle

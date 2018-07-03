@@ -16,7 +16,6 @@
 
 namespace paddle {
 namespace framework {
-ReaderBase::~ReaderBase() {}
 
 FileReader::FileReader(const std::vector<DDim> &dims) : dims_(dims) {}
 
