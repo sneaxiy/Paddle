@@ -35,7 +35,7 @@ EagerDeletionOpHandle::EagerDeletionOpHandle(
       ref_cnts_(ref_cnts) {
 #ifdef PADDLE_WITH_CUDA
   if (platform::is_gpu_place(place)) {
-    dev_ctx_ = static_cast<platform::CUDADeviceContext *>(
+    dev_ctx_ = reinterpret_cast<platform::CUDADeviceContext *>(
         platform::DeviceContextPool::Instance().Get(place));
     if (dynamic_cast<StreamGarbageCollector<Tensor> *>(gc_)) {
       platform::CUDADeviceGuard guard(
@@ -73,21 +73,21 @@ void EagerDeletionOpHandle::RunImpl() {
       continue;
     }
 
+    if (it->second.fetch_sub(1) != 1) {
+      continue;
+    }
     if (var->IsType<LoDTensor>()) {
-      if (it->second.fetch_sub(1) == 1) {
-        tensors.emplace_back(var->GetMutable<LoDTensor>());
-      }
+      tensors.emplace_back(var->GetMutable<LoDTensor>());
     } else if (var->IsType<SelectedRows>()) {
-      if (it->second.fetch_sub(1) == 1) {
-        tensors.emplace_back(var->GetMutable<SelectedRows>()->mutable_value());
-      }
+      tensors.emplace_back(var->GetMutable<SelectedRows>()->mutable_value());
     } else if (var->IsType<LoDTensorArray>()) {
-      if (it->second.fetch_sub(1) == 1) {
-        auto *tensor_arr = var->GetMutable<LoDTensorArray>();
-        for (auto &t : *tensor_arr) {
-          tensors.emplace_back(&t);
-        }
+      auto *tensor_arr = var->GetMutable<LoDTensorArray>();
+      for (auto &t : *tensor_arr) {
+        tensors.emplace_back(&t);
       }
+    } else {
+      PADDLE_THROW("Type %s is not supported eager deletion",
+                   var->Type().name());
     }
   }
 
@@ -101,7 +101,7 @@ void EagerDeletionOpHandle::ClearTensors(const std::vector<Tensor *> &tensors) {
   if (event_) {
     auto compute_stream = dev_ctx_->stream();
     auto callback_stream =
-        static_cast<StreamGarbageCollector<Tensor> *>(gc_)->stream();
+        reinterpret_cast<StreamGarbageCollector<Tensor> *>(gc_)->stream();
     auto callback_func = [=]() {
       PADDLE_ENFORCE(cudaEventRecord(event_, compute_stream));
       PADDLE_ENFORCE(cudaStreamWaitEvent(callback_stream, event_, 0));
