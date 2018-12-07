@@ -41,13 +41,13 @@ class ShrinkDepsOpFunctor {
 
   template <typename OpSet>
   OpSet operator()(const OpSet &op_set) const {
-    if (op_set.size() <= 1) return op_set;
     using KeyType = typename OpSet::key_type;
     static_assert(
         std::is_base_of<OpHandleBase,
                         typename std::remove_pointer<KeyType>::type>::value,
-        "Key type of OpSet must be or derived of OpHandleBase");
+        "Key type of OpSet must be OpHandleBase, or derived of OpHandleBase");
 
+    if (op_set.size() <= 1) return op_set;
     std::vector<OpHandleBase *> ops(op_set.begin(), op_set.end());
     OpSet ret;
     auto rels = GetRelations(ops);
