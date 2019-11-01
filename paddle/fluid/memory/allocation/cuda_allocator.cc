@@ -36,13 +36,23 @@ Allocation* CUDAAllocator::AllocateImpl(size_t size) {
   platform::CUDADeviceGuard guard(place_.device);
   void* ptr;
   auto status = cudaMalloc(&ptr, size);
-  if (UNLIKELY(status != cudaSuccess)) {
-    PADDLE_ENFORCE_NE(cudaGetLastError(), cudaSuccess);
-    PADDLE_THROW_BAD_ALLOC("Cannot allocate %d on GPU %d, cuda status %d, %s",
-                           size, place_.device, status,
-                           cudaGetErrorString(status));
+  if (status == cudaSuccess) {
+    return new Allocation(ptr, size, platform::Place(place_));
   }
-  return new Allocation(ptr, size, platform::Place(place_));
+
+  if (status == cudaErrorMemoryAllocation) {
+    status = cudaSuccess;
+  }
+  PADDLE_ENFORCE_CUDA_SUCCESS(status);
+
+  status = cudaGetLastError();
+  if (status == cudaErrorMemoryAllocation) {
+    status = cudaSuccess;
+  }
+  PADDLE_ENFORCE_CUDA_SUCCESS(status);
+
+  PADDLE_THROW_BAD_ALLOC("Cannot allocate %d on GPU %d, out of memory", size,
+                         place_.device);
 }
 
 }  // namespace allocation
