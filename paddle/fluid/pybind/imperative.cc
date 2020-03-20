@@ -24,6 +24,7 @@ limitations under the License. */
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "paddle/fluid/imperative/all_reduce.h"
 #include "paddle/fluid/imperative/backward_strategy.h"
 #include "paddle/fluid/imperative/data_loader.h"
 #include "paddle/fluid/imperative/layer.h"
@@ -393,6 +394,24 @@ void BindImperative(py::module *m_ptr) {
            py::arg("zero_copy") = false, py::arg("name") = "")
       .def("__init__", &InitVarBaseFromNumpyWithArgDefault, py::arg("value"))
       .def("__init__", &InitVarBaseFromNumpyWithKwargs)
+      .def("_is_sparse",
+           [](imperative::VarBase &self) {
+             return self.Var().IsType<framework::SelectedRows>();
+           })
+      .def("_allreduce",
+           [](imperative::VarBase &self,
+              const imperative::ParallelStrategy &strategy) {
+             if (strategy.nranks_ > 1) {
+#ifdef PADDLE_WITH_NCCL
+               imperative::AllReduce(self.Var(), self.MutableVar(), strategy);
+#else
+               PADDLE_THROW(
+                   platform::errors::Fatal("AllReduce is not supported when "
+                                           "Paddle is not compiled with NCCL"));
+#endif
+             }
+           },
+           py::call_guard<py::gil_scoped_release>())
       .def("numpy",
            [](imperative::VarBase &self) -> py::array {
              const auto &tensor =

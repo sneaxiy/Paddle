@@ -418,13 +418,27 @@ class DataParallel(layers.Layer):
 
         grad_var_set = set()
         grad_vars = []
+        sparse_grad_vars = []
+
         for param in self._layers.parameters():
             # NOTE(zcd): The grad_ivar maybe no generated.
             if param.trainable and param._grad_ivar():
                 g_var = param._grad_ivar()
+                if g_var._is_sparse():
+                    sparse_grad_vars.append(g_var)
+                    continue
+
                 grad_vars.append(g_var)
                 assert g_var not in grad_var_set
                 grad_var_set.add(g_var)
+
+        if sparse_grad_vars:
+            sparse_grad_vars.sort(cmp=lambda x: x.name)
+            for grad_var in sparse_grad_vars:
+                grad_var._allreduce(self._strategy)
+
+        if not grad_vars:
+            return
 
         # FIXME(zcd): the type of the var should be LoDTensor, i.e
         # the gradients should be dense, otherwise, the following
@@ -448,8 +462,7 @@ class DataParallel(layers.Layer):
         coalesced_grads_and_vars = self._coalesce_tensors(grad_var_groups)
 
         for coalesced_grad, g_vars, g_shapes in coalesced_grads_and_vars:
-            collective._allreduce(
-                coalesced_grad, coalesced_grad, sync_mode=False)
+            coalesced_grad._allreduce(self._strategy)
 
         self._split_tensors(coalesced_grads_and_vars)
 
