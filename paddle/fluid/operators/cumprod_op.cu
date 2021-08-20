@@ -144,14 +144,6 @@ struct FillFirstZeroPositionGradFunctor {
 };
 
 template <typename T>
-static std::string ToString(const T *p, size_t n,
-                            const platform::CUDAPlace &place) {
-  std::vector<T> vec(n);
-  memory::Copy(platform::CPUPlace(), vec.data(), place, p, n * sizeof(T), 0);
-  return string::join_strings(vec, ' ');
-}
-
-template <typename T>
 class CumprodGradOpCUDAKernel : public framework::OpKernel<T> {
  public:
   void Compute(const framework::ExecutionContext &ctx) const override {
