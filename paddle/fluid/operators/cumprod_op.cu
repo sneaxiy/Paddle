@@ -54,7 +54,7 @@ template <typename T>
 struct CumprodGradFunctorExceptFirstZero {
   HOSTDEVICE CumprodGradFunctorExceptFirstZero(
       const T *x, const T *y, const T *dy_mul_y_reversed_cumsum,
-      const int64_t *zero_mask, size_t mid_dim, size_t inner_dim, T *dx,
+      const uint8_t *zero_mask, size_t mid_dim, size_t inner_dim, T *dx,
       int64_t *first_zero_idx, T *x_filled_one)
       : x_(x),
         y_(y),
@@ -71,30 +71,26 @@ struct CumprodGradFunctorExceptFirstZero {
     auto outer_idx = idx / (mid_dim_ * inner_dim_);
     auto mid_idx = (idx - inner_idx) / inner_dim_ % mid_dim_;
     auto mask = zero_mask_[idx];
-    bool should_fill_one = false;
+    bool should_fill_one = true;
 
     if (mask == 0) {
       dx_[idx] = dy_mul_y_reversed_cumsum_[idx] / x_[idx];
-      // record first zero position as -1, i.e., no zero
       if (mid_idx == mid_dim_ - 1) {
+        // record first zero position as -1, i.e., no zero
         first_zero_idx_[outer_idx * inner_dim_ + inner_idx] = -1;
       }
-      should_fill_one = true;
-    } else if (mask > 1) {
-      dx_[idx] = 0;
-    } else if (mid_idx > 0) {  // mask == 1 && mid_idx > 0
-      if (zero_mask_[idx - inner_dim_] == 1) {
+    } else if (mid_idx > 0) {                  // mask > 0
+      if (zero_mask_[idx - inner_dim_] > 0) {  // not first zero
         dx_[idx] = 0;
+        should_fill_one = false;
       } else {
         // idx is the first zero position, it should be recorded
         dx_[idx] = y_[idx - inner_dim_];
         first_zero_idx_[outer_idx * inner_dim_ + inner_idx] = mid_idx;
-        should_fill_one = true;
       }
-    } else {  // mask == 1 && mid_idx == 0
+    } else {  // the first zero position is index 0
       dx_[idx] = 1;
       first_zero_idx_[outer_idx * inner_dim_ + inner_idx] = 0;
-      should_fill_one = true;
     }
 
     x_filled_one_[idx] = should_fill_one ? 1 : x_[idx];
@@ -104,7 +100,7 @@ struct CumprodGradFunctorExceptFirstZero {
   const T *x_;
   const T *y_;
   const T *dy_mul_y_reversed_cumsum_;
-  const int64_t *zero_mask_;
+  const uint8_t *zero_mask_;
   size_t mid_dim_;
   size_t inner_dim_;
   T *dx_;
@@ -168,25 +164,25 @@ class CumprodGradOpCUDAKernel : public framework::OpKernel<T> {
         ctx.template device_context<platform::CUDADeviceContext>();
     auto *dx_data = dx->mutable_data<T>(place);
 
-    // Step 1: find cumsum-ed zero mask of x
+    // Step 1: find cummax-ed zero mask of x
     const auto &exec_policy = thrust::cuda::par.on(dev_ctx.stream());
-    auto zero_mask_without_cumsum =
-        memory::Alloc(place, numel * sizeof(int64_t));
-    auto *zero_mask_without_cumsum_data =
-        reinterpret_cast<int64_t *>(zero_mask_without_cumsum->ptr());
+    auto zero_mask_without_cummax =
+        memory::Alloc(place, numel * sizeof(uint8_t));
+    auto *zero_mask_without_cummax_data =
+        reinterpret_cast<uint8_t *>(zero_mask_without_cummax->ptr());
     thrust::transform(
         exec_policy, thrust::device_pointer_cast(x_data),
         thrust::device_pointer_cast(x_data) + numel,
-        thrust::device_pointer_cast(zero_mask_without_cumsum_data),
+        thrust::device_pointer_cast(zero_mask_without_cummax_data),
         IsZeroFunctor<T>());
 
-    auto zero_mask = memory::Alloc(place, numel * sizeof(int64_t));
-    auto *zero_mask_data = reinterpret_cast<int64_t *>(zero_mask->ptr());
-    math::InclusiveScan<int64_t, cub::Sum>(
-        zero_mask_without_cumsum_data, zero_mask_data, outer_dim, mid_dim,
-        inner_dim, static_cast<int64_t>(0), cub::Sum(), /*reverse=*/false,
+    auto zero_mask = memory::Alloc(place, numel * sizeof(uint8_t));
+    auto *zero_mask_data = reinterpret_cast<uint8_t *>(zero_mask->ptr());
+    math::InclusiveScan<uint8_t, cub::Max>(
+        zero_mask_without_cummax_data, zero_mask_data, outer_dim, mid_dim,
+        inner_dim, static_cast<uint8_t>(0), cub::Max(), /*reverse=*/false,
         dev_ctx);
-    zero_mask_without_cumsum = nullptr;
+    zero_mask_without_cummax = nullptr;
 
     // Step 2: calculate reversed cumsum(dy * y)
     auto dy_mul_y = memory::Alloc(place, numel * sizeof(T));
