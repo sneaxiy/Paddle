@@ -172,12 +172,14 @@ class ShardingGradView:
             if not hasattr(slice_param, "main_grad"):
                 slice_param.main_grad = slice_grad
             else:
-                assert slice_param.main_grad is slice_grad
+                if not self._release_grad:
+                    assert slice_param.main_grad is slice_grad
         elif slice_grad is not None:
             if slice_param.grad is None:
                 slice_param._copy_gradient_from(slice_grad)
             else:
-                assert slice_param.grad._is_shared_buffer_with(slice_grad)
+                if not self._release_grad:
+                    assert slice_param.grad._is_shared_buffer_with(slice_grad)
 
     def _reset_grad_buffer(self):
         if self._slice_grad is not None:
