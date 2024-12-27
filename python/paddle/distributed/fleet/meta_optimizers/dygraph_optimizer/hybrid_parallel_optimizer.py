@@ -65,12 +65,11 @@ class HybridParallelClipGrad:
         # add all reduce to get global norm of distributed params_and_grads
         if sharding_flag:
             # norm of mp distributed variable
-            if mp_flag:
-                # dist should reduce among sharding group、mp group、pp group
-                paddle.distributed.all_reduce(
-                    global_norm_var_dist,
-                    group=self._hcg.get_sharding_parallel_group(),
-                )
+            # dist should reduce among sharding group、mp group、pp group
+            paddle.distributed.all_reduce(
+                global_norm_var_dist,
+                group=self._hcg.get_sharding_parallel_group(),
+            )
             # not dist only reduce among sharding group and pp group later
             paddle.distributed.all_reduce(
                 global_norm_var_not_dist,
