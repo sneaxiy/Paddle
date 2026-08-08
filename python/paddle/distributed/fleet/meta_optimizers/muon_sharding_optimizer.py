@@ -432,6 +432,44 @@ class MuonShardingOptimizer:
             if id(b) not in self._sync_only_buffer_ids
         )
 
+        # ---- Overlap the optimizer update with the parameter sync ----
+        # When enabled, step() walks the parameter-sync groups one by one: it
+        # updates the params this rank owns in a group and immediately launches
+        # that group's sync asynchronously, so the communication runs on the
+        # comm stream while the next group's update runs on the calc stream.
+        self.overlap_optimize_and_sync = bool(
+            int(
+                os.environ.get(
+                    "FLAGS_muon_sharding_overlap_optimize_and_sync", 1
+                )
+            )
+        )
+        if self.overlap_optimize_and_sync:
+            if self.use_group_call_opt:
+                # The hierarchical group-call sync runs on the calc stream via
+                # _coalescing_manager, so it cannot overlap with the update.
+                logger.warning(
+                    "comm_group_call_opt syncs parameters on the calc stream; "
+                    "disabling overlap_optimize_and_sync."
+                )
+                self.overlap_optimize_and_sync = False
+            elif not all(
+                hasattr(optimizer, name)
+                for name in (
+                    "apply_grad_clip",
+                    "prepare_optimize",
+                    "update_params",
+                    "muon_group_key",
+                )
+            ):
+                logger.warning(
+                    f"{type(optimizer).__name__} does not expose the staged "
+                    "update API; disabling overlap_optimize_and_sync."
+                )
+                self.overlap_optimize_and_sync = False
+        # Lazily built on the first step(), once comm buffers are collected.
+        self._sync_stages = None
+
         # ---- Register backward hooks for communication overlap ----
         # When comm_overlap is enabled, each parameter's backward hook feeds its
         # gradient into the owning comm buffer via add_grad. Once all of a
@@ -1360,6 +1398,192 @@ class MuonShardingOptimizer:
                 comm_buffer.sync_params()
 
     # ------------------------------------------------------------------
+    # Overlap of the optimizer update with the parameter sync
+    # ------------------------------------------------------------------
+
+    def _build_sync_stages(self):
+        """Plan the group-level pipeline of "update params -> sync params".
+
+        Returns an ordered list of stages. Each stage is a dict with:
+          - ``kind``: ``'2d'`` (broadcast) or ``'1d'`` (all-gather)
+          - ``local_params``: params this rank updates before the stage's
+            communication is launched
+          - ``'2d'`` only: ``rank2params`` (every rank's 2D params belonging to
+            the stage, i.e. one broadcast per owner rank), ``group``,
+            ``world_size``
+          - ``'1d'`` only: ``buffer``, the FusedCommBuffer to all-gather
+
+        The plan is derived purely from globally replicated metadata, so every
+        rank builds the identical stage list and the collectives are issued in
+        the same order everywhere.
+
+        Bit-for-bit equality with the non-pipelined update is what dictates the
+        cut points: Muon batches all parameters sharing a *group key* (see
+        :meth:`~paddle.optimizer.Muon.muon_group_key`) into one Newton-Schulz
+        call, so a key must never be spread over two stages. 2D params are
+        therefore cut along key boundaries, adjacent keys are merged until a
+        stage reaches ``comm_buffer_size_MB`` (to keep the number of broadcasts
+        low), and a key that spans several colors is updated in full by the
+        first stage that needs it - later stages then only broadcast it.
+        """
+        stage_numel_limit = (
+            self.comm_buffer_size_MB if self.comm_buffer_size_MB > 0 else 256
+        ) * (1024 * 1024 // 4)
+
+        default_group = self._hcg.get_sharding_parallel_group()
+        stages = []
+        # Muon group key -> params owned by this rank, in the order the
+        # non-pipelined path feeds them to the optimizer.
+        key_to_local_params = defaultdict(list)
+
+        for color_key, rank2params in self._rank2params_2d_by_color.items():
+            group_info = self._color_to_group_info.get(color_key, {})
+            group = group_info.get('group', default_group)
+            world_size = group_info.get('world_size', 1)
+            rank_key = group_info.get('rank', 0) if world_size > 1 else 0
+
+            param_to_key = {}
+            key_order = []
+            key_numel = {}
+            for p in self._params_2d_by_color[color_key]:
+                key = self._inner_opt.muon_group_key(p)
+                if key not in key_numel:
+                    key_order.append(key)
+                    key_numel[key] = 0
+                key_numel[key] += int(
+                    functools_reduce(lambda x, y: x * y, p.shape, 1)
+                )
+                param_to_key[p.name] = key
+            for p in rank2params.get(rank_key, []):
+                key_to_local_params[param_to_key[p.name]].append(p)
+
+            # Merge adjacent keys until the stage is large enough to be worth
+            # a separate broadcast.
+            stage_key_groups = []
+            cur_keys, cur_numel = [], 0
+            for key in key_order:
+                cur_keys.append(key)
+                cur_numel += key_numel[key]
+                if cur_numel >= stage_numel_limit:
+                    stage_key_groups.append(cur_keys)
+                    cur_keys, cur_numel = [], 0
+            if cur_keys:
+                stage_key_groups.append(cur_keys)
+
+            for keys in stage_key_groups:
+                key_set = set(keys)
+                rank2stage_params = {}
+                for rank, params in rank2params.items():
+                    stage_params = [
+                        p for p in params if param_to_key[p.name] in key_set
+                    ]
+                    if stage_params:
+                        rank2stage_params[rank] = stage_params
+                if not rank2stage_params:
+                    continue
+                stages.append(
+                    {
+                        'kind': '2d',
+                        'color': color_key,
+                        'group': group,
+                        'world_size': world_size,
+                        'rank2params': rank2stage_params,
+                        'keys': keys,
+                        'local_params': [],
+                    }
+                )
+
+        # A group key is updated as a whole by the first stage that broadcasts
+        # any of its params; the params it owns in later stages are then already
+        # up to date by the time those stages communicate.
+        updated_keys = set()
+        for stage in stages:
+            for key in stage['keys']:
+                if key in updated_keys:
+                    continue
+                updated_keys.add(key)
+                stage['local_params'].extend(key_to_local_params[key])
+
+        for comm_buffer in self._comm_buffer_list:
+            stages.append(
+                {
+                    'kind': '1d',
+                    'buffer': comm_buffer,
+                    'local_params': [
+                        self._slice_params[p.name]
+                        for p in comm_buffer.params
+                        if p.name in self._slice_params
+                    ],
+                }
+            )
+
+        return stages
+
+    def _launch_stage_sync(self, stage):
+        """Launch one stage's parameter sync asynchronously; return its tasks."""
+        if stage['kind'] == '2d':
+            if stage['world_size'] <= 1:
+                # Single-rank group: the owner already holds the final values.
+                return []
+            return self._broadcast_2d_params(
+                stage['rank2params'], stage['group']
+            )
+
+        comm_buffer = stage['buffer']
+        comm_buffer.sync_param_task = None
+        # Pass a fresh dict: sync_params' default param2task argument is shared
+        # between calls and would accumulate param names across steps.
+        comm_buffer.sync_params(sync=False, param2task={})
+        task = comm_buffer.sync_param_task
+        comm_buffer.sync_param_task = None
+        return [] if task is None else [task]
+
+    def _step_with_sync_overlap(self, params_grads):
+        """Update the parameters group by group, overlapping update and sync.
+
+        Gradient clipping spans every gradient, so it is done once up-front and
+        is never overlapped. Afterwards each parameter-sync group is handled in
+        turn: the params this rank owns in the group are updated on the calc
+        stream, then the group's sync is launched on the comm stream, so it runs
+        while the next group is being updated.
+        """
+        inner = self._inner_opt
+
+        params_grads = inner.apply_grad_clip(params_grads)
+        muon_params, adamw_params = inner.prepare_optimize(params_grads)
+
+        # Keyed by id(): a 1D slice param shares its name with the full param.
+        muon_map = {id(p): (p, g) for p, g in muon_params}
+        adamw_map = {id(p): (p, g) for p, g in adamw_params}
+
+        tasks = []
+        with framework.no_grad():
+            for stage in self._sync_stages:
+                stage_muon = []
+                stage_adamw = []
+                for param in stage['local_params']:
+                    entry = muon_map.pop(id(param), None)
+                    if entry is not None:
+                        stage_muon.append(entry)
+                        continue
+                    entry = adamw_map.pop(id(param), None)
+                    if entry is not None:
+                        stage_adamw.append(entry)
+
+                if stage_muon or stage_adamw:
+                    inner.update_params(stage_muon, stage_adamw)
+                tasks.extend(self._launch_stage_sync(stage))
+
+            assert not muon_map and not adamw_map, (
+                "these parameters belong to no parameter-sync group: "
+                f"{[p.name for p, _ in muon_map.values()]} (muon) "
+                f"{[p.name for p, _ in adamw_map.values()]} (adamw)"
+            )
+
+            for task in tasks:
+                task.wait()
+
+    # ------------------------------------------------------------------
     # Clear gradients
     # ------------------------------------------------------------------
 
@@ -1441,6 +1665,9 @@ class MuonShardingOptimizer:
         self._collect_comm_buffers()
         self._assign_slice_grad()
 
+        if self.overlap_optimize_and_sync and self._sync_stages is None:
+            self._sync_stages = self._build_sync_stages()
+
         if not isinstance(self._origin_parameter_list[0], dict):
             params_grads = []
 
@@ -1484,6 +1711,14 @@ class MuonShardingOptimizer:
                     grad_var = slice_p.main_grad
                 if grad_var is not None:
                     params_grads.append((slice_p, grad_var))
+
+            if (
+                self.overlap_optimize_and_sync
+                and not g_shard_bypass_dygraph_optimizer
+            ):
+                # Update and sync group by group, overlapping the two.
+                self._step_with_sync_overlap(params_grads)
+                return
 
             self._apply_optimize(
                 loss=None,

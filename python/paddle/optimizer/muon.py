@@ -707,6 +707,147 @@ class Muon(Optimizer):
     # Core optimization step
     # ------------------------------------------------------------------
 
+    def _should_use_muon(self, param):
+        """Whether ``param`` is updated by Muon (as opposed to AdamW)."""
+        param_info = self._muon_param_info_map.get(param.name)
+        if param_info is not None:
+            return param_info.use_muon
+        use_muon = _default_should_use_muon(
+            param.name,
+            getattr(param, "original_shape", param.shape),
+            self._muon_exclude_patterns,
+        )
+        _logger.warning(
+            f"muon_param_info_map does not have {param.name}, "
+            f"falling back to default rule: use_muon={use_muon}"
+        )
+        return use_muon
+
+    def muon_group_key(self, param):
+        """Key deciding which Muon parameters are batched into one update.
+
+        Parameters sharing a key are stacked into a single Newton-Schulz call by
+        :meth:`update_params`. Callers that pipeline the update (e.g.
+        ``MuonShardingOptimizer``'s overlapped step) can therefore split
+        parameters into arbitrary groups without perturbing the numerics, as
+        long as no key is split across two groups and the relative order inside
+        a key is preserved.
+        """
+        param_shape = getattr(param, "original_shape", param.shape)
+        param_info = self._muon_param_info_map.get(param.name)
+
+        func_key = None
+        if param_info and param_info.split_concat_func is not None:
+            func = param_info.split_concat_func
+            if hasattr(func, "func"):
+                # functools.partial: group by the underlying function
+                # object plus all bound args/kwargs.
+                func_key = (
+                    func.func,
+                    tuple(_to_hashable(v) for v in func.args),
+                    tuple(
+                        (k, _to_hashable(v))
+                        for k, v in sorted((func.keywords or {}).items())
+                    ),
+                )
+            else:
+                func_key = func
+
+        return (func_key, tuple(param_shape))
+
+    def apply_grad_clip(self, params_grads):
+        """Run the configured gradient clipping over ``params_grads``.
+
+        Gradient clipping is global (the norm spans every gradient), so it is
+        kept separate from the per-parameter update to let callers clip once and
+        then update the parameters group by group.
+        """
+        if self._grad_clip is not None:
+            params_grads = self._grad_clip(params_grads)
+        return params_grads
+
+    def prepare_optimize(self, params_grads):
+        """Create the accumulators of ``params_grads`` and split muon/adamw.
+
+        Returns ``(muon_params_grads, adamw_params_grads)``, both keeping the
+        order of ``params_grads``.
+        """
+        # apply for zcc
+        self._maybe_refuse()
+
+        group = self._default_dict
+        muon_params = []
+        adamw_params = []
+        for param, grad in params_grads:
+            if grad is None:
+                continue
+
+            use_muon = self._should_use_muon(param)
+            self._ensure_accumulators(param, use_muon, group)
+            if use_muon:
+                muon_params.append((param, grad))
+            else:
+                adamw_params.append((param, grad))
+        return muon_params, adamw_params
+
+    def update_params(self, muon_params, adamw_params):
+        """Update the given parameters. No grad clip, no accumulator creation.
+
+        ``prepare_optimize`` must have been called on the parameters first.
+        """
+        group = self._default_dict
+        lr = self._learning_rate
+        if isinstance(lr, paddle.optimizer.lr.LRScheduler):
+            lr = lr()
+        wd = group.get("weight_decay", 0.0)
+
+        # --- Muon updates ---
+        if muon_params:
+            # Group parameters by split_concat_func and shape, then update
+            # each group in one batched call.
+            muon_groups = defaultdict(list)
+            for param, grad in muon_params:
+                assert len(param.shape) == 2 or len(param.shape) == 3, (
+                    "Muon only supports 2D or 3D parameters."
+                )
+                muon_groups[self.muon_group_key(param)].append((param, grad))
+
+            for key, group_params in muon_groups.items():
+                for sub_group in self._split_group_by_bytes(group_params):
+                    self._muon_update_group(
+                        sub_group,
+                        lr,
+                        group.get("momentum", 0.95),
+                        group.get("ns_steps", 5),
+                        group.get("nesterov", True),
+                        group.get("epsilon", 1e-9),
+                        wd,
+                        version=group.get("muon_version", 3),
+                    )
+
+        # --- AdamW updates ---
+        if adamw_params:
+            # ``adamw_`` needs the learning rate as a tensor. Build it with
+            # ``paddle.full`` rather than ``paddle.to_tensor``: the latter
+            # copies from a host numpy buffer via a blocking ``cudaMemcpy``,
+            # which drains the compute stream and serialises the optimizer
+            # step against any overlapped communication.
+            lr_tensor_f64 = paddle.full([], lr, dtype=paddle.float64)
+            for param, grad in adamw_params:
+                self._adamw_update(
+                    param,
+                    grad,
+                    lr_tensor_f64,
+                    self._get_accumulator(self._moment_acc_str, param),
+                    self._get_accumulator(self._moment2_acc_str, param),
+                    self._get_accumulator(self._beta1_pow_acc_str, param),
+                    self._get_accumulator(self._beta2_pow_acc_str, param),
+                    group.get("adam_beta1", 0.9),
+                    group.get("adam_beta2", 0.95),
+                    group.get("epsilon", 1e-9),
+                    wd,
+                )
+
     def _apply_optimize(self, loss, startup_program, params_grads):
         if not framework.in_dygraph_mode():
             raise NotImplementedError(
@@ -717,106 +858,9 @@ class Muon(Optimizer):
         if g_shard_bypass_dygraph_optimizer:
             return
 
-        if self._grad_clip is not None:
-            params_grads = self._grad_clip(params_grads)
-
-        # apply for zcc
-        self._maybe_refuse()
-
-        group = self._default_dict
-        lr = self._learning_rate
-        if isinstance(lr, paddle.optimizer.lr.LRScheduler):
-            lr = lr()
-        wd = group.get("weight_decay", 0.0)
-
-        muon_params = []
-        adamw_params = []
-        for param, grad in params_grads:
-            if grad is None:
-                continue
-
-            param_info = self._muon_param_info_map.get(param.name)
-            if param_info is not None:
-                use_muon = param_info.use_muon
-            else:
-                use_muon = _default_should_use_muon(
-                    param.name,
-                    getattr(param, "original_shape", param.shape),
-                    self._muon_exclude_patterns,
-                )
-                _logger.warning(
-                    f"muon_param_info_map does not have {param.name}, "
-                    f"falling back to default rule: use_muon={use_muon}"
-                )
-
-            self._ensure_accumulators(param, use_muon, group)
-            if use_muon:
-                muon_params.append((param, grad))
-            else:
-                adamw_params.append((param, grad))
-
-        # --- Pass 2: Muon updates ---
-        lr_tensor = paddle.to_tensor(lr, dtype=paddle.float32)
-        lr_tensor_f64 = paddle.to_tensor(lr, dtype=paddle.float64)
-
-        # Group parameters by split_concat_func and shape, then update
-        # each group in one batched call.
-        muon_groups = defaultdict(list)
-        for param, grad in muon_params:
-            assert len(param.shape) == 2 or len(param.shape) == 3, (
-                "Muon only supports 2D or 3D parameters."
-            )
-            param_shape = getattr(param, "original_shape", param.shape)
-            param_info = self._muon_param_info_map.get(param.name)
-
-            func_key = None
-            if param_info and param_info.split_concat_func is not None:
-                func = param_info.split_concat_func
-                if hasattr(func, "func"):
-                    # functools.partial: group by the underlying function
-                    # object plus all bound args/kwargs.
-                    func_key = (
-                        func.func,
-                        tuple(_to_hashable(v) for v in func.args),
-                        tuple(
-                            (k, _to_hashable(v))
-                            for k, v in sorted((func.keywords or {}).items())
-                        ),
-                    )
-                else:
-                    func_key = func
-
-            key = (func_key, tuple(param_shape))
-            muon_groups[key].append((param, grad))
-
-        for key, group_params in muon_groups.items():
-            for sub_group in self._split_group_by_bytes(group_params):
-                self._muon_update_group(
-                    sub_group,
-                    lr_tensor,
-                    group.get("momentum", 0.95),
-                    group.get("ns_steps", 5),
-                    group.get("nesterov", True),
-                    group.get("epsilon", 1e-9),
-                    wd,
-                    version=group.get("muon_version", 3),
-                )
-
-        # --- Pass 3: AdamW updates ---
-        for param, grad in adamw_params:
-            self._adamw_update(
-                param,
-                grad,
-                lr_tensor_f64,
-                self._get_accumulator(self._moment_acc_str, param),
-                self._get_accumulator(self._moment2_acc_str, param),
-                self._get_accumulator(self._beta1_pow_acc_str, param),
-                self._get_accumulator(self._beta2_pow_acc_str, param),
-                group.get("adam_beta1", 0.9),
-                group.get("adam_beta2", 0.95),
-                group.get("epsilon", 1e-9),
-                wd,
-            )
+        params_grads = self.apply_grad_clip(params_grads)
+        muon_params, adamw_params = self.prepare_optimize(params_grads)
+        self.update_params(muon_params, adamw_params)
 
     @framework.dygraph_only
     def step(self) -> None:
@@ -910,11 +954,9 @@ class Muon(Optimizer):
                     # V2 is unaffected: its moments are always 1D shards,
                     # so shape always matches and reshape is never triggered.
                     target_shape = sharded_param.local_shape
-                    if (
-                        tuple(tensor.shape) != tuple(target_shape)
-                        and tensor.numel()
-                        == paddle.to_tensor(list(target_shape)).prod().item()
-                    ):
+                    if tuple(tensor.shape) != tuple(target_shape) and math.prod(
+                        tensor.shape
+                    ) == math.prod(target_shape):
                         tensor = tensor.reshape(target_shape)
                     sharded_state[unified_name] = (
                         create_sharded_weight_with_new_local(
